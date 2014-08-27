@@ -653,14 +653,11 @@ write_prompt(terminal, s::ASCIIString) = write(terminal, s)
 normalize_key(key::Char) = string(key)
 normalize_key(key::Integer) = normalize_key(char(key))
 function normalize_key(key::String)
-    '\0' in key && error("Matching \\0 not currently supported.")
     buf = IOBuffer()
     i = start(key)
     while !done(key, i)
         c, i = next(key, i)
-        if c == '*'
-            write(buf, '\0')
-        elseif c == '^'
+        if c == '^'
             c, i = next(key, i)
             write(buf, uppercase(c)-64)
         elseif c == '\\'
@@ -689,74 +686,60 @@ end
 # If we ever actually want to match \0 in input, this will have to be reworked
 function normalize_keymap(keymap::Dict)
     ret = Dict{String,Function}()
-    for key in keys(keymap)
+    # handle direct values first
+    redirects = filter((k,v) -> !(typeof(v) <: Union(Function, Nothing)), keymap)
+    for (key, value) in setdiff(keymap, redirects)
         newkey = normalize_key(key)
-        if haskey(ret, newkey)
+        if newkey in keys(ret)
             println(ret)
             error("Conflicting Definitions for keyseq " * escape_string(newkey) * " within one keymap")
         end
 
-        # keymap[key] can be a Char, String, Function, (or Expr)
-        # convert all of these into a Function callable with (MIState/PromptState, AbstractRepl, HistoryProvider)
-        ret[newkey] = normalize_action(keymap[key], ret)
+        ret[newkey] = normalize_action(value, ret)
+    end
+    for (key, value) in redirects
+        if normalize_key(value) in keys(ret)
+            ret[normalize_key(key)] = ret[normalize_key(value)]
+        else # look for a wildcard
+            wildkey = normalize_key(value[1:end-1] * "*")
+            !(wildkey in keys(ret)) && error("Could not find matching key for redirect of " * escape_string(key))
+            ret[normalize_key(key)] = ret[wildkey]
+        end
     end
     ret
 end
 
-normalize_action(c::Union(Char,String), keymap::Dict) = keymap(keymap[normalize_key(c)])
-normalize_action(expr::Expr, keymap::Dict) = @eval (s, data, hp) -> $expr
-normalize_action(n::Nothing, keymap::Dict) = (s, data, hp) -> nothing
+normalize_action(n::Nothing, keymap::Dict) = (s, data, hp, c) -> nothing
 function normalize_action(f::Function, keymap::Dict)
-    # create a function which is callable with (MIState/PromptState, AbstractRepl, HistoryProvider)
-    numargs = f.env.max_args
-    if numargs == 0
-        return (s, data, hp) -> f()
-    elseif numargs == 1
-        return (s, data, hp) -> f(s)
-    elseif numargs == 2
-        return (s, data, hp) -> f(s,data)
-    else
-        return f
-    end
+    # create a function which is callable with (MIState/PromptState, AbstractRepl, HistoryProvider, Char)
+    # numargs = f.env.max_args
+    # if numargs == 0
+    #     return (s, data, hp, c) -> f()
+    # elseif numargs == 1
+    #     return (s, data, hp, c) -> f(s)
+    # elseif numargs == 2
+    #     return (s, data, hp, c) -> f(s, data)
+    # elseif numargs == 3
+    #     return (s, data, hp, c) -> f(s, data, hp)
+    # else
+    #     return f
+    # end
+    f
 end
 
-keymap_gen_body(keymaps, body::Expr, level) = body
-keymap_gen_body(keymaps, body::Function, level) = keymap_gen_body(keymaps, :($(body)(s)))
-keymap_gen_body(keymaps, body::Char, level) = keymap_gen_body(keymaps, keymaps[body])
-keymap_gen_body(keymaps, body::Nothing, level) = nothing
-function keymap_gen_body(keymaps, body::String, level)
-    if length(body) == 1
-        return keymap_gen_body(keymaps, body[1], level)
-    end
-    current = keymaps
-    for c in body
-        if haskey(current, c)
-            if isa(current[c], Dict)
-                current = current[c]
-            else
-                return keymap_gen_body(keymaps, current[c], level)
-            end
-        elseif haskey(current, '\0')
-            return keymap_gen_body(keymaps, current['\0'], level)
-        else
-            error("No match for redirected key $body")
-        end
-    end
-    error("No exact match for redirected key $body")
-end
-
-function keymap_fcn(keymap)
+function keymap_fcn(keymap, s)
     maxlen = mapreduce(length, max, keys(keymap))
     c = string(read(terminal(s), Char))
-    while length(c) < maxlen
+    while true
         if c in keys(keymap)
             update_key_repeats(s, last(c))
             return keymap[c]
         end
         c *= string(read(terminal(s), Char))
+        (eof(terminal(s)) || length(c) > maxlen) && break
     end
     # didn't match, return default
-    return keymap["\0"]
+    return keymap["*"]
 end
 
 update_key_repeats(s, keystroke) = nothing
@@ -766,89 +749,48 @@ function update_key_repeats(s::MIState, keystroke)
     return
 end
 
-export @keymap
+export keymap
 
-# deep merge where target has higher precedence
-function keymap_merge!(target::Dict, source::Dict)
-    for k in keys(source)
-        if !haskey(target, k)
-            target[k] = source[k]
-        elseif isa(target[k], Dict)
-            keymap_merge!(target[k], source[k])
-        else
-            # Ignore, target has higher precedence
-        end
-    end
-end
-
-fixup_keymaps!(d, l, s, sk) = nothing
-function fixup_keymaps!(dict::Dict, level, s, subkeymap)
-    if level > 1
-        for d in dict
-            fixup_keymaps!(d[2], level-1, s, subkeymap)
-        end
-    else
-        if haskey(dict, s)
-            if isa(dict[s], Dict) && isa(subkeymap, Dict)
-                keymap_merge!(dict[s], subkeymap)
-            end
-        else
-            dict[s] = deepcopy(subkeymap)
-        end
-    end
-end
-
-function add_specialisations(dict, subdict, level)
-    default_branch = subdict['\0']
-    if isa(default_branch, Dict)
-        for s in keys(default_branch)
-            s == '\0' && add_specialisations(dict, default_branch, level+1)
-            fixup_keymaps!(dict, level, s, default_branch[s])
-        end
-    end
-end
-
-fix_conflicts!(x) = fix_conflicts!(x, 1)
-fix_conflicts!(others, level) = nothing
-function fix_conflicts!(dict::Dict, level)
-    # needs to be done first for every branch
-    if haskey(dict, '\0')
-        add_specialisations(dict, dict, level)
-    end
-    for d in dict
-        d[1] == '\0' && continue
-        fix_conflicts!(d[2], level+1)
-    end
-end
-
-keymap_prepare(keymaps::Expr) = keymap_prepare(eval(keymaps))
 keymap_prepare(keymaps::Dict) = keymap_prepare([keymaps])
 function keymap_prepare{D<:Dict}(keymaps::Array{D})
-    push!(keymaps, {"*"=>(s,data,c)->(error("Unrecognized input"))})
+    push!(keymaps, {"*"=>(s,data,hp,c)->(error("Unrecognized input"))})
     keymaps = map(normalize_keymap, keymaps)
-    map(fix_conflicts!, keymaps)
+    # map(fix_conflicts!, keymaps)
     keymaps
 end
 
 function keymap_unify(keymaps)
-    length(keymaps) == 1 && return keymaps[1]
-    ret = Dict{Char,Any}()
-    for keymap in keymaps
-        keymap_merge!(ret, keymap)
-    end
-    fix_conflicts!(ret)
-    return ret
+    keymap = merge!(keymaps...)
+    expand_wildcards!(keymap)
+    keymap
 end
 
-macro keymap(keymaps)
-    dict = keymap_unify(keymap_prepare(keymaps))
-    body = keymap_gen_body(dict, dict)
-    esc(quote
-        (s, data) -> begin
-            $body
-            return :ok
+function expand_wildcard(key)
+    prefix, suffix = rsplit(key, '*', limit=2)
+    ret = String[]
+    for c in ['A':'Z', '0':'9']
+        push!(ret, string(prefix, c, suffix))
+    end
+    ret
+end
+
+# For each wildcard key, search for other keys that match the prefix. Then,
+# replace the wildcard key with the set difference between itself concatenated
+# with any ASCII char and the set of matched prefix keys
+function expand_wildcards!(keymap)
+    wildcards = filter((k,v) -> length(k) > 1 && '*' in k, keymap)
+    for (k,v) in wildcards
+        newkeys = setdiff(expand_wildcard(k), keys(keymap))
+        for nk in newkeys
+            keymap[nk] = v
         end
-    end)
+        delete!(keymap, k)
+    end
+end
+
+function keymap(keymaps)
+    dict = keymap_unify(keymap_prepare(keymaps))
+    return (s, data, hp, c) -> keymap_fcn(dict, s)(s, data, hp, c); return :ok
 end
 
 const escape_defaults = merge!(
@@ -856,14 +798,7 @@ const escape_defaults = merge!(
     { # And ignore other escape sequences by default
     "\e*" => nothing,
     "\e[*" => nothing,
-    # Also ignore extended escape sequences
     # TODO: Support ranges of characters
-    "\e[1**" => nothing,
-    "\e[2**" => nothing,
-    "\e[3**" => nothing,
-    "\e[4**" => nothing,
-    "\e[5**" => nothing,
-    "\e[6**" => nothing,
     "\e[1~" => "\e[H",
     "\e[4~" => "\e[F",
     "\e[7~" => "\e[H",
@@ -873,8 +808,10 @@ const escape_defaults = merge!(
     "\eOC"  => "\e[C",
     "\eOD"  => "\e[D",
     "\eOH"  => "\e[H",
-    "\eOF"  => "\e[F",
-})
+    "\eOF"  => "\e[F"},
+    # Also ignore extended escape sequences
+    {"\e[" * string(i) => nothing for i=100:120} # what is the relevant range here?
+)
 
 function write_response_buffer(s::PromptState, data)
     offset = s.input_buffer.ptr
@@ -1090,7 +1027,7 @@ function setup_search_keymap(hp)
         end,
         "*"       => (s,data,c)->(LineEdit.edit_insert(data.query_buffer, c); LineEdit.update_display_buffer(s, data))
     }
-    p.keymap_func = @eval @LineEdit.keymap $([pkeymap, escape_defaults])
+    p.keymap_func = keymap([pkeymap, escape_defaults])
     keymap = {
         "^R"    => s->(enter_search(s, p, true)),
         "^S"    => s->(enter_search(s, p, false)),
@@ -1324,7 +1261,7 @@ function reset_state(s::MIState)
     end
 end
 
-const default_keymap_func = @LineEdit.keymap [LineEdit.default_keymap, LineEdit.escape_defaults]
+const default_keymap_func = keymap([LineEdit.default_keymap, LineEdit.escape_defaults])
 
 function Prompt(prompt;
     first_prompt = prompt,
